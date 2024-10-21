@@ -124,8 +124,8 @@ class Twitter2BskyLifecycle(Service):
         pw_service = Launart.current().get_component(PlaywrightLifecycle)
         async with pw_service.page() as page:
             await page.goto("https://x.com/home")
-            await page.wait_for_selector('a[aria-label="Profile"]')
-            xpath_expression = '//a[@aria-label="Profile"]'
+            await page.wait_for_selector('a[@data-testid="AppTabBar_Profile_Link"]')
+            xpath_expression = '//a[@data-testid="AppTabBar_Profile_Link"]'
             profile_link_element = await page.query_selector(xpath_expression)
             if profile_link_element and (
                 href := await profile_link_element.get_attribute("href")
