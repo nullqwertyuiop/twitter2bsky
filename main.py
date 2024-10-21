@@ -6,6 +6,7 @@
 
 import asyncio
 import re
+import signal
 from asyncio.log import logger
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -188,6 +189,7 @@ class Twitter2BskyLifecycle(Service):
             logger.warning(
                 f"[2] 未找到 Bsky 用户: {e.response.content.message}"  # type: ignore
             )
+            
 
         # method 3: search for Bsky handle in Twitter name
         try:
@@ -204,8 +206,10 @@ class Twitter2BskyLifecycle(Service):
             return await self.search_actor(user.name)  # typical for default handles
         except ValueError:
             logger.error(f"[4] 未找到 {user.name}, 的 Bsky 用户，放弃")
+            raise
         except Exception as e:
             logger.error(f"未预期的错误: {e}")
+            raise
 
     async def find_and_follow(self, user: TwitterUser):
         bsky_did = await self.find_bsky_user(user)
@@ -235,6 +239,7 @@ class Twitter2BskyLifecycle(Service):
                 except Exception as e:
                     logger.error(f"未能处理用户 {user.name} ({user.handle}): {e}")
                     failed += 1
+            signal.raise_signal(signal.SIGINT)
 
         async with self.stage("cleanup"):
             logger.success(f"已关注 {total - failed} 个用户")
