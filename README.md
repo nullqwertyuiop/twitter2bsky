@@ -58,7 +58,7 @@
 
 1. 激活虚拟环境状态下，输入：
    ```
-   py main.py
+   python main.py
    ```
 2. 按提示在程序中输入 Bluesky 的账号信息。
 
