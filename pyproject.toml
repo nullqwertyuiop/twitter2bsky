@@ -1,0 +1,29 @@
+[project]
+name = "twitter2bsky"
+version = "0.1.0"
+description = "Default template for PDM package"
+authors = [
+    {name = "nullqwertyuiop", email = "null@member.fsf.org"},
+]
+dependencies = [
+    "tweet-crawler @ git+https://github.com/nullqwertyuiop/tweet-crawler.git",
+    "launart>=0.8.2",
+    "aiohttp>=3.10.10",
+    "atproto>=0.0.54",
+]
+requires-python = ">=3.10,<3.12"
+readme = "README.md"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+
+[tool.pdm]
+distribution = true
+
+[tool.pdm.dev-dependencies]
+dev = [
+    "-e git+https://github.com/nullqwertyuiop/tweet-crawler.git#egg=tweet-crawler",
+]
