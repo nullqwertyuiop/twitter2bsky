@@ -8,7 +8,7 @@ import asyncio
 import re
 import signal
 from asyncio.log import logger
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Final, Set
 
@@ -124,7 +124,7 @@ class Twitter2BskyLifecycle(Service):
         pw_service = Launart.current().get_component(PlaywrightLifecycle)
         async with pw_service.page() as page:
             await page.goto("https://x.com/home")
-            await page.wait_for_selector('a[@data-testid="AppTabBar_Profile_Link"]')
+            await page.wait_for_selector('//a[@data-testid="AppTabBar_Profile_Link"]')
             xpath_expression = '//a[@data-testid="AppTabBar_Profile_Link"]'
             profile_link_element = await page.query_selector(xpath_expression)
             if profile_link_element and (
@@ -149,77 +149,63 @@ class Twitter2BskyLifecycle(Service):
         me = await self.client.login(bsky_handle, bsky_password)
         logger.success(f"已以 {me.display_name} ({me.handle}) 登录 Bsky")
 
-    async def search_actor(self, screen_name: str) -> str:
+    async def _attempt_handling(self, handle: str) -> str | None:
+        with suppress(BadRequestError):
+            did = (await self.client.resolve_handle(handle)).did
+            return did
+
+    async def _search_actor(self, screen_name: str) -> str | None:
         url = BSKY_SEARCH.format(handle=screen_name, limit=10)
         async with self.aiohttp_session.get(url) as response:
             response.raise_for_status()
             data = await response.json()
-            if data["actors"]:
-                if len(data["actors"]) > 1:
-                    logger.warning(f"[S] 找到多个 Bsky 用户: {screen_name}, 放弃")
-                    raise ValueError()
-                user = data["actors"][0]
-                logger.success(f"[S] 已找到 Bsky 用户: {screen_name} ({user['did']})")
+            actors = data.get("actors", [])
+            if len(actors) == 1:
+                user = actors[0]
                 return user["did"]
-            raise ValueError()
+            if len(actors) > 1:
+                logger.warning(f"找到多个 Bsky 用户: {screen_name}, 放弃")
 
     async def find_bsky_user(self, user: TwitterUser) -> str | None:
-
-        # method 1: search for Bsky handle in Twitter bio
         handle_pattern = re.compile(r"@[\w_]+(\.[\w_]+)+")
+
+        # Method 1: Handle pattern in description
         for match in handle_pattern.finditer(user.description):
-            handle = match.group(0)[1:]
-            try:
-                did = (await self.client.resolve_handle(handle)).did
-                logger.success(f"[1] 已找到 Bsky 用户: {handle} ({did})")
-                return did
-            except BadRequestError as e:
-                logger.warning(
-                    f"[1] 未找到 Bsky 用户: {e.response.content.message}"  # type: ignore
-                )
+            result = await self._attempt_handling(match.group(0)[1:])
+            if result:
+                return result
 
-        # method 2: search for Bsky handle in Twitter screen name
-        try:
-            did = (
-                await self.client.resolve_handle(f"{user.screen_name}.bsky.social")
-            ).did
-            logger.success(f"[2] 已找到 Bsky 用户: {user.screen_name} ({did})")
-            return did
-        except BadRequestError as e:
-            logger.warning(
-                f"[2] 未找到 Bsky 用户: {e.response.content.message}"  # type: ignore
-            )
-            
+        # Method 2: screen_name.bsky.social
+        if result := await self._attempt_handling(f"{user.screen_name}.bsky.social"):
+            return result
+        
+        no_special_chars = re.sub(r'[^a-zA-Z0-9-]', '', user.screen_name)
+        if result := await self._attempt_handling(f"{no_special_chars}.bsky.social"):
+            return result
+        
+        dash_only = re.sub(r'[^a-zA-Z0-9-]', '', user.screen_name.replace('_', '-'))
+        if result := await self._attempt_handling(f"{dash_only}.bsky.social"):
+            return result
 
-        # method 3: search for Bsky handle in Twitter name
-        try:
-            return await self.search_actor(
-                user.screen_name
-            )  # typical for custom handles
-        except ValueError:
-            logger.warning(f"[3] 未找到 {user.screen_name} 的 Bsky 用户")
-        except Exception as e:
-            logger.error(f"未预期的错误: {e}")
+        # Method 3: Search actor by screen_name
+        if result := await self._search_actor(user.screen_name):
+            return result
 
-        # method 4: search for Bsky handle in Twitter display name
-        try:
-            return await self.search_actor(user.name)  # typical for default handles
-        except ValueError:
-            logger.error(f"[4] 未找到 {user.name}, 的 Bsky 用户，放弃")
-            raise
-        except Exception as e:
-            logger.error(f"未预期的错误: {e}")
-            raise
+        # Method 4: Search actor by name
+        if result := await self._search_actor(user.name):
+            return result
+
+        raise ValueError()
 
     async def find_and_follow(self, user: TwitterUser):
-        bsky_did = await self.find_bsky_user(user)
-        if bsky_did:
+        if bsky_did := await self.find_bsky_user(user):
             bsky_user = await self.client.get_profile(bsky_did)
             await self.client.follow(bsky_did)
             logger.success(
                 f"已关注 {user.name} ({user.handle}) 在 Bsky 上的账号: "
                 f"{bsky_user.display_name} ({bsky_user.handle})"
             )
+            return True
 
     async def launch(self, manager: Launart):
         self.aiohttp_session = ClientSession()
