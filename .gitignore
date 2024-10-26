@@ -135,4 +135,7 @@ var/
 venv.bak/
 venv/
 wheels/
+
+# Runtime data
 persistent/
+runtime.json

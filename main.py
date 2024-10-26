@@ -5,6 +5,7 @@
 # 人和代码只要一个能跑就行
 
 import asyncio
+import json
 import re
 import signal
 from asyncio.log import logger
@@ -12,7 +13,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Final, Set
 
-from aiohttp import ClientSession
+from aiohttp import ClientResponseError, ClientSession
 from atproto import AsyncClient
 from atproto.exceptions import BadRequestError
 from creart import it
@@ -89,6 +90,25 @@ class Twitter2BskyLifecycle(Service):
     id = "misc.service/t2b"
     client: AsyncClient
     aiohttp_session: ClientSession
+    storage: dict[str, str]
+    twitter_following: list[TwitterUser]
+
+    def load_storage(self):
+        try:
+            self.storage = json.loads(
+                Path(__file__).with_name("runtime.json").read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            logger.warning("未找到运行时数据，将创建新文件")
+            self.storage = {}
+        except json.JSONDecodeError:
+            logger.error("运行时数据文件损坏，将创建新文件")
+            self.storage = {}
+
+    def save_storage(self):
+        Path(__file__).with_name("runtime.json").write_text(
+            json.dumps(self.storage, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     @property
     def required(self) -> Set[str]:
@@ -116,7 +136,7 @@ class Twitter2BskyLifecycle(Service):
         async with pw_service.page() as page:
             await page.goto("https://x.com/i/flow/login")
             await page.wait_for_url("https://x.com/home", timeout=0)
-            logger.success("Logged in to Twitter")
+            logger.success("已登录 Twitter")
         await pw_service.launch_pw(headless=True)
 
     @staticmethod
@@ -131,14 +151,13 @@ class Twitter2BskyLifecycle(Service):
                 href := await profile_link_element.get_attribute("href")
             ):
                 screen_name = href.split("/")[-1]
-                logger.success(f"已找到用户名: {screen_name}")
+                logger.success(f"已找到用户名: {screen_name!r}")
             else:
                 logger.error("未能找到用户名")
                 await asyncio.sleep(1)  # ensure logger output is printed
                 screen_name = input("请输入推特用户名: ")
             crawler = TwitterFollowingCrawler(page, screen_name)
             result = await crawler.run()
-            logger.success(f"已找到 {len(result)} 个关注的用户")
         return result
 
     async def bsky_login(self):
@@ -147,7 +166,7 @@ class Twitter2BskyLifecycle(Service):
         bsky_handle = input("请输入 Bsky 用户名: ")
         bsky_password = input("请输入 Bsky 密码: ")
         me = await self.client.login(bsky_handle, bsky_password)
-        logger.success(f"已以 {me.display_name} ({me.handle}) 登录 Bsky")
+        logger.success(f"已以 {me.display_name!r} ({me.handle}) 登录 Bsky")
 
     async def _attempt_handling(self, handle: str) -> str | None:
         with suppress(BadRequestError):
@@ -155,16 +174,17 @@ class Twitter2BskyLifecycle(Service):
             return did
 
     async def _search_actor(self, screen_name: str) -> str | None:
-        url = BSKY_SEARCH.format(handle=screen_name, limit=10)
-        async with self.aiohttp_session.get(url) as response:
-            response.raise_for_status()
-            data = await response.json()
-            actors = data.get("actors", [])
-            if len(actors) == 1:
-                user = actors[0]
-                return user["did"]
-            if len(actors) > 1:
-                logger.warning(f"找到多个 Bsky 用户: {screen_name}, 放弃")
+        with suppress(ClientResponseError):
+            url = BSKY_SEARCH.format(handle=screen_name, limit=10)
+            async with self.aiohttp_session.get(url) as response:
+                response.raise_for_status()
+                data = await response.json()
+                actors = data.get("actors", [])
+                if len(actors) == 1:
+                    user = actors[0]
+                    return user["did"]
+                if len(actors) > 1:
+                    logger.warning(f"找到多个 Bsky 用户: {screen_name}, 放弃")
 
     async def find_bsky_user(self, user: TwitterUser) -> str | None:
         handle_pattern = re.compile(r"@[\w_]+(\.[\w_]+)+")
@@ -178,12 +198,12 @@ class Twitter2BskyLifecycle(Service):
         # Method 2: screen_name.bsky.social
         if result := await self._attempt_handling(f"{user.screen_name}.bsky.social"):
             return result
-        
-        no_special_chars = re.sub(r'[^a-zA-Z0-9-]', '', user.screen_name)
+
+        no_special_chars = re.sub(r"[^a-zA-Z0-9-]", "", user.screen_name)
         if result := await self._attempt_handling(f"{no_special_chars}.bsky.social"):
             return result
-        
-        dash_only = re.sub(r'[^a-zA-Z0-9-]', '', user.screen_name.replace('_', '-'))
+
+        dash_only = re.sub(r"[^a-zA-Z0-9-]", "", user.screen_name.replace("_", "-"))
         if result := await self._attempt_handling(f"{dash_only}.bsky.social"):
             return result
 
@@ -195,40 +215,56 @@ class Twitter2BskyLifecycle(Service):
         if result := await self._search_actor(user.name):
             return result
 
-        raise ValueError()
+        raise ValueError("未找到 Bsky 用户")
 
     async def find_and_follow(self, user: TwitterUser):
         if bsky_did := await self.find_bsky_user(user):
             bsky_user = await self.client.get_profile(bsky_did)
+            self.storage[user.screen_name] = bsky_user.handle
             await self.client.follow(bsky_did)
             logger.success(
-                f"已关注 {user.name} ({user.handle}) 在 Bsky 上的账号: "
-                f"{bsky_user.display_name} ({bsky_user.handle})"
+                f"已关注 {user.name!r} ({user.screen_name}) 在 Bsky 上的账号: "
+                f"{bsky_user.display_name!r} ({bsky_user.handle})"
             )
+            self.save_storage()
             return True
 
     async def launch(self, manager: Launart):
         self.aiohttp_session = ClientSession()
+        self.load_storage()
+        self.twitter_following = []
 
         async with self.stage("preparing"):
             await self.get_twitter_cookies()
 
         async with self.stage("blocking"):
-            following = await self.fetch_following()
-            total = len(following)
+            self.twitter_following = await self.fetch_following()
+            total = len(self.twitter_following)
+            self.twitter_following = [
+                user
+                for user in self.twitter_following
+                if user.screen_name not in self.storage
+            ]
+            followed = total - len(self.twitter_following)
+            logger.success(f"已找到 {total} 个关注的用户，其中 " f"{followed} 个已关注")
             await self.bsky_login()
             failed = 0
-            while following:
-                user = following.pop()
+            while not manager.status.exiting and self.twitter_following:
+                user = self.twitter_following.pop()
                 try:
                     await self.find_and_follow(user)
                 except Exception as e:
-                    logger.error(f"未能处理用户 {user.name} ({user.handle}): {e}")
+                    logger.error(
+                        f"未能处理用户 {user.name!r} ({user.screen_name}): {e}"
+                    )
                     failed += 1
             signal.raise_signal(signal.SIGINT)
 
         async with self.stage("cleanup"):
-            logger.success(f"已关注 {total - failed} 个用户")
+            self.save_storage()
+            logger.success(
+                f"已关注 {total - failed} 个用户，{followed} 个已在运行时数据中"
+            )
             if failed:
                 logger.error(f"未能关注 {failed} 个用户")
             await self.aiohttp_session.close()
