@@ -16,6 +16,7 @@ from typing import Final, Set
 from aiohttp import ClientResponseError, ClientSession
 from atproto import AsyncClient
 from atproto.exceptions import BadRequestError
+from atproto_client import models as atproto_models
 from creart import it
 from launart import Launart, Service
 from launart.status import Phase
@@ -29,6 +30,10 @@ BSKY_SEARCH: Final[str] = (
     "https://public.api.bsky.app/xrpc/"
     "app.bsky.actor.searchActorsTypeahead"
     "?q={handle}&limit={limit}"
+)
+HANDLE_PATTERN: Final[re.Pattern[str]] = re.compile(r"@\w+(\.\w+)+")
+PROFILE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?:https?://)?bsky\.app/profile/(\w+(?:\.\w+)+)"
 )
 
 
@@ -187,13 +192,21 @@ class Twitter2BskyLifecycle(Service):
                     logger.warning(f"找到多个 Bsky 用户: {screen_name}, 放弃")
 
     async def find_bsky_user(self, user: TwitterUser) -> str | None:
-        handle_pattern = re.compile(r"@[\w_]+(\.[\w_]+)+")
-
-        # Method 1: Handle pattern in description
-        for match in handle_pattern.finditer(user.description):
+        # Method 1: Handle pattern in user profile
+        for match in HANDLE_PATTERN.finditer(user.description):
             result = await self._attempt_handling(match.group(0)[1:])
             if result:
                 return result
+        for user_url in user.entities.description.urls:
+            if match := PROFILE_PATTERN.match(user_url.expanded_url):
+                result = await self._attempt_handling(match.group(1))
+                if result:
+                    return result
+        for user_url in user.entities.url.urls:
+            if match := PROFILE_PATTERN.match(user_url.expanded_url):
+                result = await self._attempt_handling(match.group(1))
+                if result:
+                    return result
 
         # Method 2: screen_name.bsky.social
         if result := await self._attempt_handling(f"{user.screen_name}.bsky.social"):
@@ -215,19 +228,16 @@ class Twitter2BskyLifecycle(Service):
         if result := await self._search_actor(user.name):
             return result
 
-        raise ValueError("未找到 Bsky 用户")
-
-    async def find_and_follow(self, user: TwitterUser):
+    async def find_and_follow(
+        self, user: TwitterUser
+    ) -> "atproto_models.AppBskyActorDefs.ProfileViewDetailed":
         if bsky_did := await self.find_bsky_user(user):
             bsky_user = await self.client.get_profile(bsky_did)
             self.storage[user.screen_name] = bsky_user.handle
             await self.client.follow(bsky_did)
-            logger.success(
-                f"已关注 {user.name!r} ({user.screen_name}) 在 Bsky 上的账号: "
-                f"{bsky_user.display_name!r} ({bsky_user.handle})"
-            )
             self.save_storage()
-            return True
+            return bsky_user
+        raise ValueError("未找到 Bsky 用户")
 
     async def launch(self, manager: Launart):
         self.aiohttp_session = ClientSession()
@@ -251,11 +261,18 @@ class Twitter2BskyLifecycle(Service):
             failed = 0
             while not manager.status.exiting and self.twitter_following:
                 user = self.twitter_following.pop()
+                progress = f"[{total - len(self.twitter_following)}/{total}]"
                 try:
-                    await self.find_and_follow(user)
+                    bsky_user = await self.find_and_follow(user)
+                    logger.success(
+                        f"{progress} 已关注 {user.name!r} ({user.screen_name}) "
+                        f"在 Bsky 上的账号: {bsky_user.display_name!r} "
+                        f"({bsky_user.handle})"
+                    )
                 except Exception as e:
                     logger.error(
-                        f"未能处理用户 {user.name!r} ({user.screen_name}): {e}"
+                        f"{progress} 未能处理用户 {user.name!r} "
+                        f"({user.screen_name}): {e}"
                     )
                     failed += 1
             signal.raise_signal(signal.SIGINT)
